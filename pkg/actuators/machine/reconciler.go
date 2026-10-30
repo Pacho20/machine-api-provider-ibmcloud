@@ -310,16 +310,6 @@ func (r *Reconciler) reconcileMachineWithCloudState(conditionFailed *ibmcloudpro
 		}
 	}
 
-	// Update Machine Status Addresses
-	ipAddr := *newInstance.PrimaryNetworkInterface.PrimaryIP.Address
-	if ipAddr != "" {
-		networkAddresses := []apicorev1.NodeAddress{{Type: apicorev1.NodeInternalDNS, Address: r.machine.Name}}
-		networkAddresses = append(networkAddresses, apicorev1.NodeAddress{Type: apicorev1.NodeInternalIP, Address: ipAddr})
-		r.machine.Status.Addresses = networkAddresses
-	} else {
-		return fmt.Errorf("could not get the primary ipv4 address of instance: %v", newInstance.Name)
-	}
-
 	clusterID := r.machine.Labels[machinev1.MachineClusterIDLabel]
 	accountID, err := r.ibmClient.GetAccountID()
 	if err != nil {
@@ -330,7 +320,9 @@ func (r *Reconciler) reconcileMachineWithCloudState(conditionFailed *ibmcloudpro
 	providerID := fmt.Sprintf("ibm://%s///%s/%s", accountID, clusterID, *newInstance.ID)
 	currProviderID := r.machine.Spec.ProviderID
 
-	// Provider ID check and update
+	// The provider ID and the instance ID are set as soon as the instance exists, whatever its lifecycle state. If
+	// the instance disappears later, the machine controller marks the machine as Failed instead of creating a new
+	// instance for it, so a machine is never associated with more than one instance.
 	if currProviderID != nil && *currProviderID == providerID {
 		klog.Infof("%s: provider id already set in the machine Spec with value:%s", r.machine.Name, *currProviderID)
 	} else {
@@ -338,9 +330,50 @@ func (r *Reconciler) reconcileMachineWithCloudState(conditionFailed *ibmcloudpro
 		klog.Infof("%s: provider id set at machine spec: %s", r.machine.Name, providerID)
 	}
 
+	r.providerStatus.InstanceID = newInstance.ID
+
+	// IBM Cloud registers a new instance in the background, and the instance is not usable until its lifecycle
+	// state is stable. If the registration does not complete, IBM Cloud withdraws the instance and deletes it,
+	// possibly hours later. This behaviour is not publicly documented; it was confirmed by the IBM Cloud
+	// infrastructure team.
+	//
+	// While a machine is provisioning and its instance is not stable, the addresses, the instance state and the
+	// instance labels and annotations are not set, as the status of an instance can be running while its
+	// registration is pending or has failed. Instead, the MachineCreated condition reports the lifecycle state and
+	// its reasons, and the machine is requeued without leaving the Provisioning phase. Once a withdrawn instance is
+	// deleted, the machine controller marks the machine as Failed because it has a provider ID, and a
+	// MachineHealthCheck can remediate it.
+	if lifecycleState := ptr.Deref(newInstance.LifecycleState, ""); lifecycleState != vpcv1.InstanceLifecycleStateStableConst {
+		if r.machineProvisioning() {
+			// A failed lifecycle state has its own reason, as the instance is not expected to become stable anymore
+			reason := ibmcloudproviderv1.MachineCreationInProgress
+			if lifecycleState == vpcv1.InstanceLifecycleStateFailedConst {
+				reason = ibmcloudproviderv1.MachineCreationFailed
+			}
+			condition := ibmcloudproviderv1.IBMCloudMachineProviderCondition{
+				Type:    ibmcloudproviderv1.MachineCreated,
+				Reason:  reason,
+				Message: fmt.Sprintf("instance lifecycle state is %q%s", lifecycleState, lifecycleReasons(newInstance)),
+				Status:  apicorev1.ConditionFalse,
+			}
+			r.providerStatus.Conditions = reconcileProviderConditions(r.providerStatus.Conditions, condition)
+			return fmt.Errorf("%s: %w", condition.Message, &machinecontroller.RequeueAfterError{RequeueAfter: requeueAfterSeconds * time.Second})
+		}
+		klog.V(3).Infof("%s: instance lifecycle state is %q%s", r.machine.Name, lifecycleState, lifecycleReasons(newInstance))
+	}
+
+	// Update Machine Status Addresses
+	ipAddr := *newInstance.PrimaryNetworkInterface.PrimaryIP.Address
+	if ipAddr != "" {
+		networkAddresses := []apicorev1.NodeAddress{{Type: apicorev1.NodeInternalDNS, Address: r.machine.Name}}
+		networkAddresses = append(networkAddresses, apicorev1.NodeAddress{Type: apicorev1.NodeInternalIP, Address: ipAddr})
+		r.machine.Status.Addresses = networkAddresses
+	} else {
+		return fmt.Errorf("could not get the primary ipv4 address of instance: %v", newInstance.Name)
+	}
+
 	// Set providerStatus in machine
 	r.providerStatus.InstanceState = newInstance.Status
-	r.providerStatus.InstanceID = newInstance.ID
 
 	// Update conditions
 	conditionSuccess := ibmcloudproviderv1.IBMCloudMachineProviderCondition{
@@ -369,6 +402,33 @@ func (r *Reconciler) reconcileMachineWithCloudState(conditionFailed *ibmcloudpro
 		return &machinecontroller.RequeueAfterError{RequeueAfter: requeueAfterSeconds * time.Second}
 	}
 	return nil
+}
+
+// machineProvisioning returns true if the machine is in the Provisioning phase.
+func (r *Reconciler) machineProvisioning() bool {
+	return ptr.Deref(r.machine.Status.Phase, "") == machinev1.PhaseProvisioning
+}
+
+// lifecycleReasons returns the reasons for the lifecycle state of the instance, to be appended to a message. Reasons
+// without a code or a message are reported with the part that is set, reasons without either of them are skipped.
+func lifecycleReasons(instance *vpcv1.Instance) string {
+	reasons := make([]string, 0, len(instance.LifecycleReasons))
+	for _, reason := range instance.LifecycleReasons {
+		code, message := ptr.Deref(reason.Code, ""), ptr.Deref(reason.Message, "")
+		switch {
+		case code != "" && message != "":
+			reasons = append(reasons, fmt.Sprintf("%s: %s", code, message))
+		case code != "":
+			reasons = append(reasons, code)
+		case message != "":
+			reasons = append(reasons, message)
+		}
+	}
+	if len(reasons) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf(": %s", strings.Join(reasons, ", "))
 }
 
 // checkMachineDeadline will check whether a deadline has been passed from a RFC3339 formatted start time
